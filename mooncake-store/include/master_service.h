@@ -896,7 +896,8 @@ class MasterService {
     // Eviction thread function
     void EvictionThreadFunc();
 
-    tl::expected<void, ErrorCode> PushOffloadingQueue(const std::string& key,
+    tl::expected<void, ErrorCode> PushOffloadingQueue(const UUID& client_id,
+                                                      const std::string& key,
                                                       Replica& replica);
 
     // Lease related members

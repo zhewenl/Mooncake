@@ -892,6 +892,7 @@ struct InProcMasterConfig {
     std::optional<int> http_metrics_port;
     std::optional<int> http_metadata_port;
     std::optional<uint64_t> default_kv_lease_ttl;
+    std::optional<uint64_t> default_kv_soft_pin_ttl;
     std::optional<bool> enable_offload;
     std::optional<bool> enable_cxl;
     std::optional<std::string> cxl_path;
@@ -909,6 +910,7 @@ class InProcMasterConfigBuilder {
     std::optional<int> http_metrics_port_ = std::nullopt;
     std::optional<int> http_metadata_port_ = std::nullopt;
     std::optional<uint64_t> default_kv_lease_ttl_ = std::nullopt;
+    std::optional<uint64_t> default_kv_soft_pin_ttl_ = std::nullopt;
     std::optional<bool> enable_offload_ = std::nullopt;
     std::optional<bool> enable_cxl_ = std::nullopt;
     std::optional<std::string> cxl_path_ = std::nullopt;
@@ -938,6 +940,11 @@ class InProcMasterConfigBuilder {
 
     InProcMasterConfigBuilder& set_default_kv_lease_ttl(uint64_t ttl) {
         default_kv_lease_ttl_ = ttl;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_default_kv_soft_pin_ttl(uint64_t ttl) {
+        default_kv_soft_pin_ttl_ = ttl;
         return *this;
     }
 
@@ -995,6 +1002,7 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.http_metrics_port = http_metrics_port_;
     config.http_metadata_port = http_metadata_port_;
     config.default_kv_lease_ttl = default_kv_lease_ttl_;
+    config.default_kv_soft_pin_ttl = default_kv_soft_pin_ttl_;
     config.enable_offload = enable_offload_;
     config.enable_cxl = enable_cxl_;
     config.cxl_path = cxl_path_;

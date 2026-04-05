@@ -69,9 +69,15 @@ class InProcMaster {
                 }
             }
 
+            uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
+            if (config.default_kv_soft_pin_ttl.has_value()) {
+                default_kv_soft_pin_ttl =
+                    config.default_kv_soft_pin_ttl.value();
+            }
+
             WrappedMasterServiceConfig wms_cfg;
             wms_cfg.default_kv_lease_ttl = default_kv_lease_ttl;
-            wms_cfg.default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
+            wms_cfg.default_kv_soft_pin_ttl = default_kv_soft_pin_ttl;
             wms_cfg.allow_evict_soft_pinned_objects = true;
             wms_cfg.enable_metric_reporting = false;
             wms_cfg.enable_offload = config.enable_offload.has_value()
@@ -183,6 +189,10 @@ class InProcMaster {
     std::string http_metrics_base() const {
         return std::string("http://127.0.0.1:") +
                std::to_string(http_metrics_port_);
+    }
+
+    std::shared_ptr<WrappedMasterService> wrapped_service_for_testing() const {
+        return wrapped_;
     }
 
    private:

@@ -6,6 +6,11 @@
 #include <string>
 #include <random>
 #include <barrier>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <thread>
+#include <vector>
 
 #include "real_client.h"
 #include "test_server_helpers.h"
@@ -27,6 +32,30 @@ class GLogMuter {
 
    private:
     int original_log_level_;
+};
+
+class ScopedEnvVar {
+   public:
+    ScopedEnvVar(const char* key, const std::string& value)
+        : key_(key), had_old_value_(std::getenv(key) != nullptr) {
+        if (const char* old = std::getenv(key)) {
+            old_value_ = old;
+        }
+        setenv(key, value.c_str(), 1);
+    }
+
+    ~ScopedEnvVar() {
+        if (had_old_value_) {
+            setenv(key_.c_str(), old_value_.c_str(), 1);
+        } else {
+            unsetenv(key_.c_str());
+        }
+    }
+
+   private:
+    std::string key_;
+    bool had_old_value_;
+    std::string old_value_;
 };
 
 class RealClientTest : public ::testing::Test {
@@ -1219,6 +1248,154 @@ TEST_F(RealClientTest, UpsertBatch) {
             std::string(static_cast<const char*>(buf->ptr()), buf->size()),
             *expected[i]);
     }
+}
+
+TEST_F(RealClientTest, BatchGetIntoMultiBuffersFromLocalDiskReplica) {
+    namespace fs = std::filesystem;
+    const uint64_t kv_lease_ttl_ms = 1;
+    const std::string local_hostname = "localhost:17813";
+
+    const auto tmp_dir =
+        fs::temp_directory_path() /
+        ("mc_pybind_offload_" +
+         std::to_string(
+             std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto offload_dir = tmp_dir / "offload";
+    ASSERT_TRUE(fs::create_directories(offload_dir));
+
+    ScopedEnvVar enable_offload("MOONCAKE_ENABLE_OFFLOAD", "1");
+    ScopedEnvVar offload_path("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
+                              offload_dir.string());
+    ScopedEnvVar use_uring("MOONCAKE_USE_URING", "false");
+    ScopedEnvVar heartbeat_interval(
+        "MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar offload_buffer("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES",
+                                std::to_string(4 * 1024 * 1024));
+    ScopedEnvVar total_size_limit("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES",
+                                  std::to_string(1024ULL * 1024 * 1024));
+    ScopedEnvVar bucket_max_total("MOONCAKE_BUCKET_MAX_TOTAL_SIZE",
+                                  std::to_string(1024ULL * 1024 * 1024));
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_default_kv_lease_ttl(kv_lease_ttl_ms)
+                                  .set_default_kv_soft_pin_ttl(0)
+                                  .set_enable_offload(true)
+                                  .set_eviction_high_watermark_ratio(0.5)
+                                  .set_root_fs_dir("")  // Disable HA snapshot persistence for this test
+                                  .build()));
+    master_address_ = master_.master_address();
+
+    ConfigDict config = {
+        {"local_hostname", local_hostname},
+        {"metadata_server", "P2PHANDSHAKE"},
+        {"master_server_addr", master_address_},
+        {"global_segment_size", std::to_string(16 * 1024 * 1024)},
+        {"local_buffer_size", std::to_string(16 * 1024 * 1024)},
+        {"protocol", FLAGS_protocol},
+        {"enable_offload", "true"},
+    };
+    if (FLAGS_protocol == std::string("rdma")) {
+        config["rdma_devices"] = FLAGS_device_name;
+    }
+
+    auto setup_result = py_client_->setup_internal(config);
+    ASSERT_TRUE(setup_result) << toString(setup_result.error());
+
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
+
+    const size_t value_size = 1024 * 1024;
+    const std::string key = "local_disk_multibuffer";
+    std::string expected(value_size, 'L');
+    ASSERT_EQ(py_client_->put(key, std::span<const char>(expected.data(),
+                                                         expected.size()),
+                              replicate_config),
+              0);
+
+    for (int i = 0; i < 32; ++i) {
+        std::string filler_key = "local_disk_fill_" + std::to_string(i);
+        std::string filler_value(value_size, static_cast<char>('A' + (i % 26)));
+        py_client_->put(
+            filler_key,
+            std::span<const char>(filler_value.data(), filler_value.size()),
+            replicate_config);
+    }
+
+    auto wait_for_local_disk_replica = [&]() -> std::optional<UUID> {
+        auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto replica_descs = py_client_->get_replica_desc(key);
+            for (const auto& replica_desc : replica_descs) {
+                if (replica_desc.is_local_disk_replica()) {
+                    return replica_desc.get_local_disk_descriptor().client_id;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        return std::nullopt;
+    };
+
+    auto local_disk_client_id = wait_for_local_disk_replica();
+    ASSERT_TRUE(local_disk_client_id.has_value())
+        << "Key never gained a local disk replica";
+
+    auto wrapped = master_.wrapped_service_for_testing();
+    ASSERT_NE(wrapped, nullptr);
+
+    auto clear_memory_replica = [&]() {
+        auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto clear_result = wrapped->BatchReplicaClear(
+                {key}, *local_disk_client_id, local_hostname);
+            if (clear_result && !clear_result->empty()) {
+                return true;
+            }
+            const auto replica_descs = py_client_->get_replica_desc(key);
+            bool has_memory = false;
+            bool has_local_disk = false;
+            for (const auto& replica_desc : replica_descs) {
+                has_memory = has_memory || replica_desc.is_memory_replica();
+                has_local_disk =
+                    has_local_disk || replica_desc.is_local_disk_replica();
+            }
+            if (has_local_disk && !has_memory) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return false;
+    };
+
+    ASSERT_TRUE(clear_memory_replica())
+        << "Failed to clear the memory replica after local disk offload";
+
+    const auto final_replica_descs = py_client_->get_replica_desc(key);
+    ASSERT_EQ(final_replica_descs.size(), 1);
+    ASSERT_TRUE(final_replica_descs[0].is_local_disk_replica());
+
+    std::vector<char> output(value_size, '\0');
+    ASSERT_EQ(py_client_->register_buffer(output.data(), output.size()), 0);
+
+    const size_t chunk_size = value_size / 4;
+    std::vector<void*> output_ptrs;
+    std::vector<size_t> output_sizes;
+    for (size_t i = 0; i < 4; ++i) {
+        output_ptrs.emplace_back(output.data() + i * chunk_size);
+        output_sizes.emplace_back(chunk_size);
+    }
+
+    const auto get_results = py_client_->batch_get_into_multi_buffers(
+        {key}, {output_ptrs}, {output_sizes}, true);
+    ASSERT_EQ(get_results.size(), 1);
+    EXPECT_EQ(get_results[0], static_cast<int>(value_size));
+    EXPECT_EQ(std::string(output.begin(), output.end()), expected);
+
+    EXPECT_EQ(py_client_->unregister_buffer(output.data()), 0);
+
+    std::error_code ec;
+    fs::remove_all(tmp_dir, ec);
 }
 
 }  // namespace testing

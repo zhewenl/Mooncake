@@ -310,6 +310,7 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     const std::unordered_map<std::string, int64_t>& offloading_objects) {
+    VLOG(1) << "offload_objects_begin object_count=" << offloading_objects.size();
     std::vector<std::vector<std::string>> buckets_keys;
     if (auto bucket_backend =
             std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
@@ -346,6 +347,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     };
 
     for (const auto& keys : buckets_keys) {
+        VLOG(1) << "offload_bucket_begin key_count=" << keys.size();
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
         auto query_result = BatchQuerySegmentSlices(keys, batch_object);
         if (!query_result) {
@@ -353,6 +355,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                        << query_result.error();
             continue;
         }
+        VLOG(1) << "offload_bucket_query_ready key_count="
+                << batch_object.size();
 
         auto eviction_handler = [this](const std::vector<std::string>&
                                            evicted_keys) {
@@ -419,6 +423,8 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
             return heartbeat_result;
         }
     }
+    VLOG(1) << "offload_heartbeat_result object_count="
+            << offloading_objects.size();
 
     // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
     auto offload_result = OffloadObjects(offloading_objects);

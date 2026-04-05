@@ -16,6 +16,7 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include <ylt/coro_http/coro_http_server.hpp>
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 namespace mooncake {
 
@@ -607,7 +608,7 @@ class RealClient : public PyClient {
      */
     tl::expected<void, ErrorCode> batch_get_into_offload_object_internal(
         const std::string &target_rpc_service_addr,
-        std::unordered_map<std::string, Slice> &objects);
+        std::unordered_map<std::string, std::vector<Slice>> &objects);
 
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
 
@@ -721,6 +722,9 @@ class RealClient : public PyClient {
     int start_ipc_server();
     int stop_ipc_server();
     void ipc_server_func();
+    std::unique_ptr<coro_rpc::coro_rpc_server> offload_rpc_server_;
+    int start_offload_rpc_server();
+    void stop_offload_rpc_server();
     // Embedded HTTP server for health-check / metrics
     std::unique_ptr<coro_http::coro_http_server> http_server_;
     int start_http_server();

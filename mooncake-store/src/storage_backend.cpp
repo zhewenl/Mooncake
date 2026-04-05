@@ -1855,7 +1855,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         return IsExist(key);
     };
 
-    while (it != offloading_objects.cend()) {
+    while (it != offloading_objects.cend() ||
+           !ungrouped_offloading_objects.empty()) {
         std::vector<std::string> bucket_keys;
         std::unordered_map<std::string, int64_t> bucket_objects;
         int64_t bucket_data_size = 0;
@@ -1875,14 +1876,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         for (int64_t i = static_cast<int64_t>(bucket_keys.size());
              i < bucket_backend_config_.bucket_keys_limit; ++i) {
             if (it == offloading_objects.cend()) {
-                for (const auto& bucket_object : bucket_objects) {
-                    ungrouped_offloading_objects.emplace(bucket_object.first,
-                                                         bucket_object.second);
-                }
-                VLOG(1) << "Add offloading objects to ungrouped pool. "
-                        << "Total ungrouped count: "
-                        << ungrouped_offloading_objects.size();
-                return {};
+                break;
             }
 
             if (it->second > bucket_backend_config_.bucket_size_limit) {
@@ -1918,6 +1912,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
             if (bucket_data_size == bucket_backend_config_.bucket_size_limit) {
                 break;
             }
+        }
+
+        if (bucket_keys.empty()) {
+            continue;
         }
 
         auto bucket_keys_count = static_cast<int64_t>(bucket_keys.size());

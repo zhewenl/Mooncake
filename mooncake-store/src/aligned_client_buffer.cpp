@@ -33,17 +33,18 @@ AlignedClientBufferAllocator::create(size_t size, const std::string& protocol,
             return nullptr;
         }
     } else {
-        // Use posix_memalign for 4096-byte alignment
-        int ret =
-            posix_memalign(&aligned_buffer, kDirectIOAlignment, aligned_size);
-        if (ret != 0) {
-            LOG(ERROR) << "AlignedClientBufferAllocator: posix_memalign failed "
-                       << "with error " << ret << " (" << strerror(ret) << ")";
+        // Use mmap for allocation — this produces a VMA that madvise() and
+        // io_uring_register_buffers() can work with (posix_memalign uses
+        // brk/sbrk which doesn't support MADV_NOHUGEPAGE, causing
+        // io_uring page-pinning to fail with EFAULT on large buffers).
+        aligned_buffer =
+            mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+        if (aligned_buffer == MAP_FAILED) {
+            LOG(ERROR) << "AlignedClientBufferAllocator: mmap failed: "
+                       << strerror(errno);
             return nullptr;
         }
-
-        // Zero-initialize the allocated memory
-        memset(aligned_buffer, 0, aligned_size);
     }
 
     // Verify alignment
@@ -53,7 +54,7 @@ AlignedClientBufferAllocator::create(size_t size, const std::string& protocol,
         if (use_hugepage) {
             free_buffer_mmap_memory(aligned_buffer, aligned_size);
         } else {
-            free(aligned_buffer);
+            munmap(aligned_buffer, aligned_size);
         }
         return nullptr;
     }
@@ -93,7 +94,7 @@ AlignedClientBufferAllocator::~AlignedClientBufferAllocator() {
             LOG(INFO) << "AlignedClientBufferAllocator: freeing aligned memory "
                       << "at " << buffer_ << " (" << allocated_size_
                       << " bytes)";
-            free(buffer_);
+            munmap(buffer_, allocated_size_);
         }
         buffer_ = nullptr;
     }

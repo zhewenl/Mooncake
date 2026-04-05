@@ -5,7 +5,7 @@
 #include <numa.h>
 #include <numaif.h>
 #include <pthread.h>
-#include <signal.h>
+#include <csignal>
 #include <thread>
 #include <stop_token>
 
@@ -51,6 +51,54 @@ bool checkAcl(aclError result, const char *message) {
     return true;
 }
 #endif
+
+std::optional<std::pair<std::string, int>> ParseHostPort(
+    const std::string &endpoint) {
+    if (endpoint.empty()) {
+        return std::nullopt;
+    }
+
+    if (endpoint[0] == '[') {
+        const size_t closing_bracket = endpoint.find(']');
+        if (closing_bracket == std::string::npos ||
+            closing_bracket + 2 > endpoint.size() ||
+            endpoint[closing_bracket + 1] != ':') {
+            return std::nullopt;
+        }
+        try {
+            int port = std::stoi(endpoint.substr(closing_bracket + 2));
+            if (port <= 0 || port > 65535) {
+                return std::nullopt;
+            }
+            return std::pair(endpoint.substr(1, closing_bracket - 1), port);
+        } catch (const std::exception &) {
+            return std::nullopt;
+        }
+    }
+
+    const size_t colon_pos = endpoint.rfind(':');
+    if (colon_pos == std::string::npos || colon_pos == 0 ||
+        colon_pos + 1 >= endpoint.size()) {
+        return std::nullopt;
+    }
+
+    try {
+        int port = std::stoi(endpoint.substr(colon_pos + 1));
+        if (port <= 0 || port > 65535) {
+            return std::nullopt;
+        }
+        return std::pair(endpoint.substr(0, colon_pos), port);
+    } catch (const std::exception &) {
+        return std::nullopt;
+    }
+}
+
+void RegisterOffloadRpcService(coro_rpc::coro_rpc_server &server,
+                               RealClient &real_client) {
+    server.register_handler<&RealClient::batch_get_offload_object>(
+        &real_client);
+    server.register_handler<&RealClient::release_offload_buffer>(&real_client);
+}
 }  // namespace
 
 PyClient::~PyClient() {}
@@ -554,8 +602,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         auto file_storage_config = FileStorageConfig::FromEnvironment();
         file_storage_ = std::make_shared<FileStorage>(
             file_storage_config, client_, this->local_rpc_addr);
+        if (start_offload_rpc_server() != 0) {
+            LOG(ERROR) << "Failed to start offload RPC server at "
+                       << this->local_rpc_addr;
+            file_storage_.reset();
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
         auto init_result = file_storage_->Init();
         if (!init_result) {
+            stop_offload_rpc_server();
+            file_storage_.reset();
             LOG(ERROR) << "file storage init failed with error: "
                        << init_result.error();
             return init_result;
@@ -673,9 +729,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    bool enable_offload = false;
+    auto it = config.find("enable_offload");
+    if (it != config.end()) {
+        enable_offload = (it->second == "1" || it->second == "true");
+    }
+
     return setup_internal(local_hostname, metadata_server, global_segment_size,
                           local_buffer_size, protocol, rdma_devices,
-                          master_server_addr, nullptr, ipc_socket_path);
+                          master_server_addr, nullptr, ipc_socket_path, 50052,
+                          enable_offload);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -706,6 +769,8 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         return {};
     }
 
+    stop_offload_rpc_server();
+    file_storage_.reset();
     stop_ipc_server();
     stop_http_server();
 
@@ -730,6 +795,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     hugepage_segment_ptrs_.clear();
     segment_ptrs_.clear();
     local_hostname = "";
+    local_rpc_addr = "";
     device_name = "";
     protocol = "";
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
@@ -843,6 +909,48 @@ int RealClient::start_http_server() {
     }
     LOG(INFO) << "Client HTTP server started on port " << FLAGS_http_port;
     return 0;
+}
+
+int RealClient::start_offload_rpc_server() {
+    if (local_rpc_addr.empty()) {
+        LOG(ERROR) << "local_rpc_addr is empty";
+        return -1;
+    }
+    auto host_port = ParseHostPort(local_rpc_addr);
+    if (!host_port) {
+        LOG(ERROR) << "Failed to parse local RPC address: " << local_rpc_addr;
+        return -1;
+    }
+
+    auto [bind_host, bind_port] = *host_port;
+    offload_rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
+        /*thread_num=*/1, /*port=*/bind_port, bind_host);
+    const char *value = std::getenv("MC_RPC_PROTOCOL");
+    if (value && std::string_view(value) == "rdma") {
+        offload_rpc_server_->init_ibv();
+    }
+    RegisterOffloadRpcService(*offload_rpc_server_, *this);
+    auto ec = offload_rpc_server_->async_start();
+    if (ec.hasResult()) {
+        LOG(ERROR) << "Failed to start offload RPC server on " << bind_host
+                   << ":" << bind_port;
+        offload_rpc_server_.reset();
+        return -1;
+    }
+
+    LOG(INFO) << "Offload RPC server started on " << bind_host << ":"
+              << bind_port;
+    return 0;
+}
+
+// Must be called before destroying RealClient, because the RPC
+// server holds a raw pointer to *this for handler dispatch.
+void RealClient::stop_offload_rpc_server() {
+    if (offload_rpc_server_) {
+        offload_rpc_server_->stop();
+        offload_rpc_server_.reset();
+        LOG(INFO) << "Offload RPC server stopped";
+    }
 }
 
 void RealClient::stop_http_server() {
@@ -2872,15 +2980,15 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     }
 
     // Prepare batch transfer data structures
-    std::unordered_map<std::string, std::unordered_map<std::string, Slice>>
+    std::unordered_map<
+        std::string, std::unordered_map<std::string, std::vector<Slice>>>
         offload_objects;
 
     for (const auto &op_it : valid_local_disk_operations) {
         const auto &replica = op_it.second.query_result.replicas.at(0);
         auto [store_segment_it, _] = offload_objects.try_emplace(
             replica.get_local_disk_descriptor().transport_endpoint);
-        store_segment_it->second.emplace(op_it.first,
-                                         op_it.second.slices.at(0));
+        store_segment_it->second.emplace(op_it.first, op_it.second.slices);
     }
 
     size_t offload_object_count = 0;
@@ -3102,6 +3210,7 @@ RealClient::batch_get_into_multi_buffers_internal(
     };
 
     std::vector<ValidKeyInfo> valid_operations;
+    std::unordered_map<std::string, ValidKeyInfo> valid_local_disk_operations;
     valid_operations.reserve(num_keys);
     for (size_t i = 0; i < num_keys; ++i) {
         const auto &key = keys[i];
@@ -3141,27 +3250,39 @@ RealClient::batch_get_into_multi_buffers_internal(
         const auto &buffers = all_buffers[i];
         std::vector<Slice> key_slices;
         key_slices.reserve(buffers.size());
-        if (replica.is_memory_replica()) {
-            for (size_t j = 0; j < buffers.size(); ++j) {
-                key_slices.emplace_back(Slice{buffers[j], sizes[j]});
-            }
-        } else {
+        for (size_t j = 0; j < buffers.size(); ++j) {
+            key_slices.emplace_back(Slice{buffers[j], sizes[j]});
+        }
+        if (!replica.is_memory_replica() &&
+            !(query_result_values.replicas.size() == 1 &&
+              query_result_values.replicas.at(0).is_local_disk_replica())) {
             LOG(ERROR) << "Invalid replica type for key: " << key;
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
             continue;
         }
 
-        valid_operations.push_back(
-            {.key = key,
-             .original_index = i,
-             .query_result = std::move(query_result_values),
-             .slices = std::move(key_slices),
-             .total_size = total_size});
+        if (query_result_values.replicas.size() == 1 &&
+            query_result_values.replicas.at(0).is_local_disk_replica()) {
+            valid_local_disk_operations.emplace(
+                key,
+                ValidKeyInfo{.key = key,
+                             .original_index = i,
+                             .query_result = std::move(query_result_values),
+                             .slices = std::move(key_slices),
+                             .total_size = total_size});
+        } else {
+            valid_operations.push_back(
+                {.key = key,
+                 .original_index = i,
+                 .query_result = std::move(query_result_values),
+                 .slices = std::move(key_slices),
+                 .total_size = total_size});
+        }
         // Set success result (actual bytes transferred)
         results.emplace_back(static_cast<int64_t>(total_size));
     }
     // Early return if no valid operations
-    if (valid_operations.empty()) {
+    if (valid_operations.empty() && valid_local_disk_operations.empty()) {
         return results;
     }
 
@@ -3177,19 +3298,44 @@ RealClient::batch_get_into_multi_buffers_internal(
         batch_slices[op.key] = op.slices;
     }
 
-    auto batch_get_results =
-        client_->BatchGet(batch_keys, batch_query_results, batch_slices,
-                          prefer_alloc_in_same_node);
+    if (!valid_operations.empty()) {
+        auto batch_get_results =
+            client_->BatchGet(batch_keys, batch_query_results, batch_slices,
+                              prefer_alloc_in_same_node);
 
-    // Process transfer results
-    for (size_t j = 0; j < batch_get_results.size(); ++j) {
-        const auto &op = valid_operations[j];
+        // Process transfer results
+        for (size_t j = 0; j < batch_get_results.size(); ++j) {
+            const auto &op = valid_operations[j];
 
-        if (!batch_get_results[j]) {
-            const auto error = batch_get_results[j].error();
-            LOG(ERROR) << "BatchGet failed for key '" << op.key
-                       << "': " << toString(error);
-            results[op.original_index] = tl::unexpected(error);
+            if (!batch_get_results[j]) {
+                const auto error = batch_get_results[j].error();
+                LOG(ERROR) << "BatchGet failed for key '" << op.key
+                           << "': " << toString(error);
+                results[op.original_index] = tl::unexpected(error);
+            }
+        }
+    }
+
+    std::unordered_map<
+        std::string, std::unordered_map<std::string, std::vector<Slice>>>
+        offload_objects;
+    for (const auto &op_it : valid_local_disk_operations) {
+        const auto &replica = op_it.second.query_result.replicas.at(0);
+        auto [store_segment_it, _] = offload_objects.try_emplace(
+            replica.get_local_disk_descriptor().transport_endpoint);
+        store_segment_it->second.emplace(op_it.first, op_it.second.slices);
+    }
+    for (auto &offload_objects_it : offload_objects) {
+        auto batch_get_offload_result = batch_get_into_offload_object_internal(
+            offload_objects_it.first, offload_objects_it.second);
+        if (!batch_get_offload_result) {
+            LOG(ERROR) << "Batch get store object failed with error: "
+                       << batch_get_offload_result.error();
+            for (const auto &offload_object_it : offload_objects_it.second) {
+                results[valid_local_disk_operations.at(offload_object_it.first)
+                            .original_index] =
+                    tl::make_unexpected(batch_get_offload_result.error());
+            }
         }
     }
     return results;
@@ -3503,6 +3649,11 @@ tl::expected<QueryTaskResponse, ErrorCode> RealClient::query_task(
 tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
 RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
                                      const std::vector<int64_t> &sizes) {
+    if (!file_storage_) {
+        LOG(ERROR)
+            << "batch_get_offload_object called but file_storage_ is null";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     auto result = file_storage_->BatchGet(keys, sizes);
     if (!result) {
         LOG(ERROR) << "Batch get offload object failed,err_code = "
@@ -3527,13 +3678,17 @@ bool RealClient::release_offload_buffer(uint64_t batch_id) {
 tl::expected<void, ErrorCode>
 RealClient::batch_get_into_offload_object_internal(
     const std::string &target_rpc_service_addr,
-    std::unordered_map<std::string, Slice> &objects) {
+    std::unordered_map<std::string, std::vector<Slice>> &objects) {
     auto start_time = std::chrono::steady_clock::now();
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
     for (const auto &object_it : objects) {
         keys.emplace_back(object_it.first);
-        sizes.emplace_back(object_it.second.size);
+        int64_t total_size = 0;
+        for (const auto &slice : object_it.second) {
+            total_size += static_cast<int64_t>(slice.size);
+        }
+        sizes.emplace_back(total_size);
     }
     auto batchGetResp = client_requester_->batch_get_offload_object(
         target_rpc_service_addr, keys, sizes);

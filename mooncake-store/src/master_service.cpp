@@ -879,8 +879,12 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     if (enable_offload_) {
         auto& shard = accessor.GetShard();
         metadata.VisitReplicas(
-            &Replica::fn_is_completed, [this, &key, &shard](Replica& replica) {
-                auto result = PushOffloadingQueue(key, replica);
+            &Replica::fn_is_completed,
+            [this, client_id, &key, &shard](Replica& replica) {
+                if (!replica.is_memory_replica()) {
+                    return;
+                }
+                auto result = PushOffloadingQueue(client_id, key, replica);
                 if (result) {
                     replica.inc_refcnt();
                     shard->offloading_tasks.emplace(
@@ -2043,6 +2047,9 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
     MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
     local_disk_segment_it->second->enable_offloading = enable_offloading;
     if (enable_offloading) {
+        VLOG(1) << "offload_heartbeat_dequeue client_id=" << client_id
+                << ", object_count="
+                << local_disk_segment_it->second->offloading_objects.size();
         return std::move(local_disk_segment_it->second->offloading_objects);
     }
     return {};
@@ -2055,6 +2062,9 @@ auto MasterService::NotifyOffloadSuccess(
     for (size_t i = 0; i < keys.size(); ++i) {
         const auto& key = keys[i];
         const auto& metadata = metadatas[i];
+        VLOG(1) << "notify_offload_success key=" << key
+                << ", client_id=" << client_id
+                << ", data_size=" << metadata.data_size;
 
         // Release refcnt and clear offloading task.
         {
@@ -2088,44 +2098,35 @@ auto MasterService::NotifyOffloadSuccess(
 }
 
 tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
-    const std::string& key, Replica& replica) {
-    const auto& segment_names = replica.get_segment_names();
-    if (segment_names.empty()) {
+    const UUID& client_id, const std::string& key, Replica& replica) {
+    if (!replica.is_memory_replica()) {
         return {};
     }
-    for (const auto& segment_name_it : segment_names) {
-        if (!segment_name_it.has_value()) {
-            continue;
-        }
-        ScopedLocalDiskSegmentAccess local_disk_segment_access =
-            segment_manager_.getLocalDiskSegmentAccess();
-        const auto& client_by_name =
-            local_disk_segment_access.getClientByName();
-        auto client_id_it = client_by_name.find(segment_name_it.value());
-        if (client_id_it == client_by_name.end()) {
-            LOG(ERROR) << "Segment " << segment_name_it.value() << " not found";
-            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-        }
-        auto& client_local_disk_segment =
-            local_disk_segment_access.getClientLocalDiskSegment();
-        auto local_disk_segment_it =
-            client_local_disk_segment.find(client_id_it->second);
-        if (local_disk_segment_it == client_local_disk_segment.end()) {
-            return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
-        }
-        MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
-        if (!local_disk_segment_it->second->enable_offloading) {
-            return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
-        }
-        if (local_disk_segment_it->second->offloading_objects.size() >=
-            offloading_queue_limit_) {
-            return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
-        }
-        local_disk_segment_it->second->offloading_objects.emplace(
-            key, replica.get_descriptor()
-                     .get_memory_descriptor()
-                     .buffer_descriptor.size_);
+
+    ScopedLocalDiskSegmentAccess local_disk_segment_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& client_local_disk_segment =
+        local_disk_segment_access.getClientLocalDiskSegment();
+    auto local_disk_segment_it = client_local_disk_segment.find(client_id);
+    if (local_disk_segment_it == client_local_disk_segment.end()) {
+        return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
     }
+
+    MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
+    if (!local_disk_segment_it->second->enable_offloading) {
+        return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
+    }
+    if (local_disk_segment_it->second->offloading_objects.size() >=
+        offloading_queue_limit_) {
+        return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+    }
+    local_disk_segment_it->second->offloading_objects.emplace(
+        key,
+        replica.get_descriptor().get_memory_descriptor().buffer_descriptor.size_);
+    VLOG(1) << "queued_offload_object key=" << key << ", client_id="
+            << client_id
+            << ", queue_size="
+            << local_disk_segment_it->second->offloading_objects.size();
     return {};
 }
 
