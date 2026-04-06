@@ -12,9 +12,10 @@ else()
     find_path(ASIO_INCLUDE_DIR
         NAMES asio.hpp
         PATHS
+            ${CMAKE_PREFIX_PATH}/include
+            ${CMAKE_INSTALL_PREFIX}/include
             /usr/local/include
             /usr/include
-            ${CMAKE_INSTALL_PREFIX}/include
         DOC "Path to ASIO headers"
     )
 
