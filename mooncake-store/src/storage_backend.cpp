@@ -2194,7 +2194,7 @@ BucketStorageBackend::PendingEviction BucketStorageBackend::PrepareEviction(
 
     if (!buckets_.empty() &&
         total_size_ + required_size > bucket_backend_config_.max_total_size) {
-        LOG_EVERY_T(INFO, 3) << "[Evict] triggered: total=" << total_size_
+        LOG(INFO) << "[Evict] triggered: total=" << total_size_
                              << "/" << bucket_backend_config_.max_total_size
                              << " required=" << required_size;
     }
@@ -2229,7 +2229,7 @@ BucketStorageBackend::PendingEviction BucketStorageBackend::PrepareEviction(
     }
 
     if (!result.buckets.empty()) {
-        LOG_EVERY_T(INFO, 3) << "[Evict] prepared: buckets="
+        LOG(INFO) << "[Evict] prepared: buckets="
                              << result.buckets.size()
                              << " keys=" << result.keys.size()
                              << " total_after=" << total_size_;
@@ -2299,7 +2299,7 @@ void BucketStorageBackend::FinalizeEviction(const PendingEviction& pending) {
         }
     }
     if (!pending.buckets.empty()) {
-        LOG_EVERY_T(INFO, 3) << "[Evict] finalized: deleted "
+        LOG(INFO) << "[Evict] finalized: deleted "
                              << pending.buckets.size() << " bucket(s)";
     }
 }

@@ -395,7 +395,7 @@ UringFile::UringFile(const std::string& filename, int fd,
                      << filename;
     }
     if (use_direct_io_) {
-        LOG_EVERY_T(INFO, 3) << "[UringFile] O_DIRECT mode enabled for "
+        LOG(INFO) << "[UringFile] O_DIRECT mode enabled for "
                              << filename;
     }
 }
@@ -604,7 +604,7 @@ tl::expected<size_t, ErrorCode> UringFile::vector_write(const iovec* iov,
                   std::chrono::steady_clock::now() - start)
                   .count();
     if (us > 1000) {
-        LOG_EVERY_T(INFO, 3) << "[UringFile::vector_write] fd=" << fd_
+        LOG(INFO) << "[UringFile::vector_write] fd=" << fd_
                              << " iovcnt=" << iovcnt << " time=" << us
                              << "us";
     }
@@ -631,7 +631,7 @@ tl::expected<size_t, ErrorCode> UringFile::vector_read(const iovec* iov,
                           ? (static_cast<double>(expected_bytes) / 1048576.0) /
                                 (static_cast<double>(us) / 1e6)
                           : 0;
-        LOG_EVERY_T(INFO, 3)
+        LOG(INFO)
             << "[UringFile::vector_read] fd=" << fd_ << " iovcnt=" << iovcnt
             << " bytes=" << expected_bytes << " time=" << us << "us ("
             << (us / 1000.0) << "ms)" << " throughput=" << mbps << "MB/s";
