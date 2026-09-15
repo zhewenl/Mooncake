@@ -1124,6 +1124,58 @@ TEST_F(TransportTest, RepeatedBatchQueryPreservesAggregatedBytes) {
     EXPECT_EQ(status.transferred_bytes, total_bytes);
 }
 
+TEST_F(TransportTest, CqCountFastPathPreservesTransferredBytes) {
+    std::string server_name = "localhost";
+    MultiTransport transport(nullptr, server_name);
+    Transport::BatchDesc batch{};
+    batch.id = reinterpret_cast<Transport::BatchID>(&batch);
+    batch.batch_size = 1;
+    batch.task_list.resize(1);
+    auto& task = batch.task_list.front();
+    task.batch_id = batch.id;
+    task.slice_count = 1;
+    Transport::Slice slice{};
+    slice.task = &task;
+    slice.length = 65536;
+    slice.markSuccess();
+    Transport::TransferStatus status{};
+    ASSERT_TRUE(transport.getBatchTransferStatus(batch.id, status).ok());
+    EXPECT_EQ(status.s, Transport::TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, 65536);
+    status = {};
+    ASSERT_TRUE(transport.getBatchTransferStatus(batch.id, status).ok());
+    EXPECT_EQ(status.transferred_bytes, 65536);
+}
+
+TEST_F(TransportTest, CqMarkSuccessPublishesBatchFinishedTaskCount) {
+    Transport::BatchDesc batch{};
+    batch.id = reinterpret_cast<Transport::BatchID>(&batch);
+    batch.batch_size = 2;
+
+    Transport::TransferTask first;
+    Transport::TransferTask second;
+    first.batch_id = batch.id;
+    second.batch_id = batch.id;
+    first.slice_count = 1;
+    second.slice_count = 1;
+
+    Transport::Slice first_slice{};
+    first_slice.task = &first;
+    first_slice.length = 4;
+    first_slice.markSuccess();
+    EXPECT_TRUE(first.is_finished);
+    EXPECT_FALSE(batch.is_finished.load());
+    EXPECT_EQ(batch.finished_task_count.load(), 1u);
+
+    Transport::Slice second_slice{};
+    second_slice.task = &second;
+    second_slice.length = 4;
+    second_slice.markSuccess();
+    EXPECT_TRUE(second.is_finished);
+    EXPECT_TRUE(batch.is_finished.load());
+    EXPECT_EQ(batch.finished_task_count.load(), 2u);
+}
+
 #ifdef USE_EVENT_DRIVEN_COMPLETION
 TEST_F(TransportTest, GroupedTaskCompletionWaitsForSubmissionSeal) {
     Transport::BatchDesc batch{};
