@@ -148,10 +148,21 @@ Status MultiTransport::submitTransfer(
 
     std::vector<Transport*> transports;
     transports.reserve(entries.size());
+    // Reuse only address-independent routes within this submission. Mixed
+    // protocol segments must still resolve each address independently, and
+    // disabling the metadata cache must retain the explicit refresh behavior.
+    Transport* last_transport = nullptr;
+    Transport::SegmentID last_target_id = 0;
     for (const auto& request : entries) {
-        Transport* transport = nullptr;
-        auto status = selectTransport(request, transport);
-        if (!status.ok()) return status;
+        Transport* transport = last_transport;
+        if (!transport || request.target_id != last_target_id) {
+            bool reusable = false;
+            auto status = selectTransport(request, transport, &reusable);
+            if (!status.ok()) return status;
+            last_transport =
+                reusable && globalConfig().metacache ? transport : nullptr;
+            last_target_id = request.target_id;
+        }
         assert(transport);
         transports.push_back(transport);
     }
@@ -609,7 +620,8 @@ Transport* MultiTransport::installTransport(const std::string& proto,
 }
 
 Status MultiTransport::selectTransport(const TransferRequest& entry,
-                                       Transport*& transport) {
+                                       Transport*& transport, bool* reusable) {
+    if (reusable) *reusable = false;
     auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
     if (!target_segment_desc) {
         return Status::InvalidArgument("Invalid target segment ID " +
@@ -694,6 +706,7 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
         return Status::OK();
     }
 #endif
+    if (reusable) *reusable = true;
 #ifdef USE_ASCEND_HETEROGENEOUS
     // When USE_ASCEND_HETEROGENEOUS is enabled:
     // - Target side directly reuses RDMA Transport

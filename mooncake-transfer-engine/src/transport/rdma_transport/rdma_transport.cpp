@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "transport/rdma_transport/rdma_batch_cache.h"
+
 #include "transport/rdma_transport/rdma_transport.h"
 
 #include <glog/logging.h>
@@ -880,6 +882,7 @@ Status RdmaTransport::submitTransferTask(
     };
     uint64_t nr_slices;
     size_t task_index = 0, request_index = 0;
+    BatchRdmaDeviceCache local_device_cache;
     int last_local_buffer_id = -1;
     int last_remote_buffer_id = -1;
     SegmentID last_remote_target_id = static_cast<SegmentID>(-1);
@@ -909,9 +912,14 @@ Status RdmaTransport::submitTransferTask(
         }
 
         auto request_buffer_id = -1, request_device_id = -1;
-        if (selectDevice(local_segment_desc.get(), (uint64_t)request.source,
-                         request.length, request_buffer_id, request_device_id,
-                         0, last_local_buffer_id)) {
+        if (local_device_cache.select(
+                local_segment_desc, (uint64_t)request.source, request.length,
+                request_buffer_id, request_device_id, [&] {
+                    return selectDevice(
+                        local_segment_desc.get(), (uint64_t)request.source,
+                        request.length, request_buffer_id, request_device_id, 0,
+                        last_local_buffer_id);
+                })) {
             request_buffer_id = -1;
             request_device_id = -1;
         } else {

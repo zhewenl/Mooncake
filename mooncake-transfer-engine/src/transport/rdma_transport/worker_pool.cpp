@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "transport/rdma_transport/rdma_batch_cache.h"
+
 #include "transport/rdma_transport/worker_pool.h"
 
 #include <sys/epoll.h>
@@ -316,6 +318,25 @@ int WorkerPool::submitPostSend(
     SliceList prepared_slice_list;
     uint64_t submitted_slice_count = 0;
     thread_local std::unordered_map<int, uint64_t> failed_target_ids;
+    BatchRdmaDeviceCache peer_device_cache;
+    // Holding the snapshot also prevents pointer reuse across a metadata
+    // refresh from aliasing a previously cached path. Rail availability is
+    // deliberately checked for every slice, outside this string cache.
+    std::shared_ptr<RdmaTransport::SegmentDesc> path_snapshot;
+    std::vector<std::string> nic_paths;
+    auto nic_path = [&](const std::shared_ptr<RdmaTransport::SegmentDesc> &desc,
+                        int device_id) -> const std::string & {
+        if (desc != path_snapshot) {
+            path_snapshot = desc;
+            nic_paths.clear();
+            nic_paths.resize(desc->devices.size());
+        }
+        auto &path = nic_paths.at(device_id);
+        if (path.empty())
+            path = MakeNicPath(desc->nicPathServerName(),
+                               desc->devices[device_id].name);
+        return path;
+    };
     int last_buffer_id = -1;
     SegmentID last_target_id = static_cast<SegmentID>(-1);
     for (auto &slice : slice_list) {
@@ -334,9 +355,14 @@ int WorkerPool::submitPostSend(
             last_buffer_id = -1;
             last_target_id = slice->target_id;
         }
-        if (selectPeerDevice(peer_segment_desc.get(), slice->rdma.dest_addr,
-                             slice->length, context_.deviceName(), buffer_id,
-                             device_id, 0, last_buffer_id)) {
+        if (peer_device_cache.select(
+                peer_segment_desc, slice->rdma.dest_addr, slice->length,
+                buffer_id, device_id, [&] {
+                    return selectPeerDevice(
+                        peer_segment_desc.get(), slice->rdma.dest_addr,
+                        slice->length, context_.deviceName(), buffer_id,
+                        device_id, 0, last_buffer_id);
+                })) {
             peer_segment_desc = context_.engine().meta()->getSegmentDescByID(
                 slice->target_id, true);
             if (!peer_segment_desc) {
@@ -365,12 +391,11 @@ int WorkerPool::submitPostSend(
         }
         slice->rdma.dest_rkey =
             peer_segment_desc->buffers[buffer_id].rkey[device_id];
-        auto peer_nic_path =
-            MakeNicPath(peer_segment_desc->nicPathServerName(),
-                        peer_segment_desc->devices[device_id].name);
+        const std::string *peer_nic_path =
+            &nic_path(peer_segment_desc, device_id);
 
         // If selected rail is paused, try alternative devices
-        if (!isRailAvailable(peer_nic_path)) {
+        if (!isRailAvailable(*peer_nic_path)) {
             bool found = false;
             for (size_t alt_dev_id = 0;
                  alt_dev_id < peer_segment_desc->devices.size(); ++alt_dev_id) {
@@ -379,14 +404,12 @@ int WorkerPool::submitPostSend(
                         peer_segment_desc->buffers[buffer_id].rkey.size()) {
                     continue;
                 }
-                auto alt_path =
-                    MakeNicPath(peer_segment_desc->nicPathServerName(),
-                                peer_segment_desc->devices[alt_dev_id].name);
+                const auto &alt_path = nic_path(peer_segment_desc, alt_dev_id);
                 if (isRailAvailable(alt_path)) {
                     device_id = alt_dev_id;
                     slice->rdma.dest_rkey =
                         peer_segment_desc->buffers[buffer_id].rkey[device_id];
-                    peer_nic_path = alt_path;
+                    peer_nic_path = &alt_path;
                     found = true;
                     break;
                 }
@@ -397,7 +420,7 @@ int WorkerPool::submitPostSend(
             }
         }
 
-        slice->peer_nic_path = peer_nic_path;
+        slice->peer_nic_path = *peer_nic_path;
         if (globalConfig().log_rdma_slice_affinity) {
             VLOG(1) << "RDMA slice affinity: source_location="
                     << sourceLocationOrUnknown(slice) << ", target_location="
