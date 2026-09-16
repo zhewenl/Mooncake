@@ -1067,7 +1067,12 @@ TEST_F(TransportTest, CqMarkSuccessPublishesBatchFinishedTaskCount) {
     second_slice.length = 4;
     second_slice.markSuccess();
     EXPECT_TRUE(second.is_finished);
+#ifdef USE_EVENT_DRIVEN_COMPLETION
     EXPECT_TRUE(batch.is_finished.load());
+#else
+    // Foreground aggregation publishes the status/byte cache when polling.
+    EXPECT_FALSE(batch.is_finished.load());
+#endif
     EXPECT_EQ(batch.finished_task_count.load(), 2u);
 }
 

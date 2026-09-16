@@ -229,12 +229,10 @@ class Transport {
             check_batch_completion(task, true);
         }
 
-#ifdef USE_EVENT_DRIVEN_COMPLETION
         static void sealTaskSubmission(TransferTask *task) {
             __atomic_store_n(&task->submission_sealed, true, __ATOMIC_RELEASE);
             check_batch_completion(task, false, false);
         }
-#endif
 
         volatile int64_t ts;
 
@@ -259,6 +257,10 @@ class Transport {
                     __atomic_load_n(&task->slice_count, __ATOMIC_ACQUIRE);
 #else
             (void)count_slice;
+            // Acquire the seal before reading the final slice count: RDMA
+            // can complete early slices while submit is still adding more.
+            if (!__atomic_load_n(&task->submission_sealed, __ATOMIC_ACQUIRE))
+                return;
             const uint64_t slice_count =
                 __atomic_load_n(&task->slice_count, __ATOMIC_ACQUIRE);
             const uint64_t success_slice_count =
@@ -266,7 +268,7 @@ class Transport {
             const uint64_t failed_slice_count =
                 __atomic_load_n(&task->failed_slice_count, __ATOMIC_ACQUIRE);
             const bool slices_done =
-                slice_count != 0 &&
+                (slice_count != 0 || !count_slice) &&
                 success_slice_count + failed_slice_count == slice_count;
 #endif
             if (!slices_done) return;
@@ -277,18 +279,18 @@ class Transport {
 
             __atomic_store_n(&task->is_finished, true, __ATOMIC_RELAXED);
 
-            // Increment the number of finished tasks in the batch
-            // (relaxed). This counter does not itself publish data; only
-            // the thread that observes the last task completion performs
-            // the release-store on batch_desc.is_finished below. The waiter
-            // pairs this with an acquire load, which makes all prior writes
-            // (including relaxed increments) visible.
+            // Publish task status/bytes and acquire earlier task completions.
+            // Batch readers acquire this counter before aggregating bytes.
+#ifndef USE_EVENT_DRIVEN_COMPLETION
+            // Keep this the last access to task/batch on the polling path:
+            // the caller may release the batch as soon as it sees all tasks.
+            batch_desc.finished_task_count.fetch_add(1,
+                                                     std::memory_order_acq_rel);
+#else
             auto prev = batch_desc.finished_task_count.fetch_add(
-                1, std::memory_order_relaxed);
-
+                1, std::memory_order_acq_rel);
             if (prev + 1 != batch_desc.batch_size) return;
 
-#ifdef USE_EVENT_DRIVEN_COMPLETION
             // Last task in the batch: wake up waiting thread directly.
             // Publish completion under the same mutex used by the waiter
             // to avoid lost notifications.
@@ -306,8 +308,6 @@ class Transport {
             // Notify after releasing the lock to avoid waking threads
             // only to block again on the mutex.
             batch_desc.completion_cv.notify_all();
-#else
-            batch_desc.is_finished.store(true, std::memory_order_release);
 #endif
         }
     };
@@ -380,9 +380,9 @@ class Transport {
 #endif
 
         volatile bool completion_published = false;
+        volatile bool submission_sealed = true;
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         volatile uint64_t completed_slice_count = 0;
-        volatile bool submission_sealed = true;
 #endif
 
         // record the origin request
@@ -415,6 +415,13 @@ class Transport {
             false};  // Completion flag for wait predicate
         std::atomic<uint64_t> finished_transfer_bytes{0};
         std::atomic<uint64_t> finished_task_count{0};
+
+        // Set before dispatch; true only if every submitted task uses a
+        // transport that publishes completion without foreground polling.
+        // As with task_list, submission and polling must be serialized.
+        bool counter_eligible = false;
+        // CQ completion alone does not publish the aggregate byte count.
+        std::atomic<bool> status_cached{false};
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         // Event-driven completion: tracks batch progress and notifies waiters
@@ -452,6 +459,11 @@ class Transport {
     // Grouped transports must append slices in request order so scatter can
     // recover per-request status after a grouped task fails.
     virtual bool supportsGroupedScatter() const { return false; }
+
+    // Opt in only if all tasks publish Slice completion without requiring
+    // getTransferStatus() to drive progress. MultiTransport seals each task
+    // after submitTransferTask() has finished constructing its slices.
+    virtual bool supportsBatchCompletionCounter() const { return false; }
 
     /// @brief Get the status of a submitted transfer. This function shall not
     /// be called again after completion.
